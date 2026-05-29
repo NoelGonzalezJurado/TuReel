@@ -31,6 +31,8 @@ async def assemble_video(
     max_duration: Optional[int] = None,
     orientation: str = "horizontal",
     music_path: Optional[Path] = None,
+    subtitle_color: str = "&H00FFFFFF",
+    subtitle_size: int = 22,
 ) -> Path:
     w, h = _RESOLUTIONS.get(orientation, (1280, 720))
 
@@ -98,15 +100,15 @@ async def assemble_video(
 
     if srt_path and srt_path.exists():
         srt_escaped = str(srt_path.absolute()).replace("\\", "/").replace(":", "\\:")
+        style = (
+            f"Fontsize={subtitle_size},PrimaryColour={subtitle_color},"
+            "OutlineColour=&H00000000,Outline=2,Shadow=1,Bold=1,"
+            "Alignment=2,MarginV=30"
+        )
         await _run_ffmpeg([
             "ffmpeg", "-y", "-i", str(muxed),
             *duration_args,
-            "-vf", (
-                f"subtitles='{srt_escaped}'"
-                ":force_style='Fontsize=22,PrimaryColour=&H00FFFFFF,"
-                "OutlineColour=&H00000000,Outline=2,Shadow=1,Bold=1,"
-                "Alignment=2,MarginV=30'"
-            ),
+            "-vf", f"subtitles='{srt_escaped}':force_style='{style}'",
             "-c:a", "copy", str(output_path),
         ])
     elif max_duration:

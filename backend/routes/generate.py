@@ -6,7 +6,8 @@ from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Form, HTTPException, UploadFile, File
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
 
 from config import settings
 from models.schemas import GenerateResponse, PreviewRequest, PreviewResponse, PreviewScene
@@ -15,14 +16,60 @@ from services import audio_generator, script_parser, subtitle_generator, video_a
 router = APIRouter()
 
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
-_MAX_DURATION = 180
+_MAX_DURATION = 600  # 10 minutos
+
+# ── Job store en memoria ──────────────────────────────────────────────────────
+# { job_id: { status, step, step_index, total_steps, result, error } }
+_jobs: dict[str, dict] = {}
+
+_STEPS = [
+    "Procesando guion...",
+    "Descargando vídeos...",
+    "Generando voz...",
+    "Generando subtítulos...",
+    "Ensamblando vídeo...",
+    "¡Listo!",
+]
+
+
+def _set_step(job_id: str, index: int):
+    _jobs[job_id]["step"] = _STEPS[index]
+    _jobs[job_id]["step_index"] = index
+
+
+# ── Voice preview ────────────────────────────────────────────────────────────
+
+class VoicePreviewRequest(BaseModel):
+    voice: str
+
+_VOICE_PREVIEW_TEXT = {
+    "es": "Hola, esta es una muestra de mi voz para tus vídeos.",
+    "en": "Hello, this is a sample of my voice for your videos.",
+    "fr": "Bonjour, voici un exemple de ma voix pour vos vidéos.",
+    "de": "Hallo, das ist eine Probe meiner Stimme für Ihre Videos.",
+    "pt": "Olá, esta é uma amostra da minha voz para os seus vídeos.",
+}
+
+@router.post("/preview-voice")
+async def preview_voice(request: VoicePreviewRequest):
+    import edge_tts, tempfile, io
+    lang = request.voice[:2].lower()
+    text = _VOICE_PREVIEW_TEXT.get(lang, _VOICE_PREVIEW_TEXT["es"])
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        communicate = edge_tts.Communicate(text, voice=request.voice)
+        await communicate.save(str(tmp_path))
+        audio_bytes = tmp_path.read_bytes()
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/mpeg")
 
 
 # ── Preview ───────────────────────────────────────────────────────────────────
 
 @router.post("/preview", response_model=PreviewResponse)
 async def preview_script(request: PreviewRequest):
-    """Parsea el guion y devuelve thumbnails de Pexels por escena (rápido, sin generar vídeo)."""
     try:
         scenes = script_parser.parse_script(request.script)
     except ValueError as e:
@@ -33,24 +80,27 @@ async def preview_script(request: PreviewRequest):
         for scene in scenes
     ], return_exceptions=True)
 
-    preview_scenes = [
+    return PreviewResponse(scenes=[
         PreviewScene(
             narration=scene.narration,
             keyword=scene.keyword,
             image_url=img if isinstance(img, str) else None,
         )
         for scene, img in zip(scenes, image_urls)
-    ]
-    return PreviewResponse(scenes=preview_scenes)
+    ])
 
 
-# ── Generate (multipart) ──────────────────────────────────────────────────────
+# ── Generate: inicia job y devuelve job_id inmediatamente ────────────────────
 
-@router.post("/generate", response_model=GenerateResponse)
+@router.post("/generate")
 async def generate_video(
     script: str = Form(...),
     duration_seconds: int = Form(60),
     orientation: str = Form("horizontal"),
+    voice: str = Form("es-ES-AlvaroNeural"),
+    subtitles_enabled: str = Form("1"),
+    subtitle_color: str = Form("&H00FFFFFF"),
+    subtitle_size: int = Form(22),
     music: Optional[UploadFile] = File(None),
 ):
     job_id = str(uuid.uuid4())[:8]
@@ -58,20 +108,53 @@ async def generate_video(
     job_dir.mkdir(parents=True, exist_ok=True)
 
     duration = max(5, min(duration_seconds, _MAX_DURATION))
+    use_subtitles = subtitles_enabled.strip() not in ("0", "false", "")
 
-    # Guardar música si se subió
+    # Guardar música si se subió (hay que leer antes de que cierre el request)
     music_path: Optional[Path] = None
     if music and music.filename:
         music_path = job_dir / "background_music.mp3"
-        with open(music_path, "wb") as f:
-            content = await music.read()
-            f.write(content)
+        music_path.write_bytes(await music.read())
 
+    _jobs[job_id] = {
+        "status": "running",
+        "step": _STEPS[0],
+        "step_index": 0,
+        "total_steps": len(_STEPS),
+        "result": None,
+        "error": None,
+    }
+
+    asyncio.create_task(_run_job(
+        job_id, script, duration, orientation, job_dir, music_path,
+        voice=voice,
+        use_subtitles=use_subtitles,
+        subtitle_color=subtitle_color,
+        subtitle_size=subtitle_size,
+    ))
+
+    return {"job_id": job_id}
+
+
+async def _run_job(
+    job_id: str,
+    script: str,
+    duration: int,
+    orientation: str,
+    job_dir: Path,
+    music_path: Optional[Path],
+    voice: str = "es-ES-AlvaroNeural",
+    use_subtitles: bool = True,
+    subtitle_color: str = "&H00FFFFFF",
+    subtitle_size: int = 22,
+):
     try:
         # 1. Parsear guion
+        _set_step(job_id, 0)
         scenes = script_parser.parse_script(script)
 
-        # 2. Descargar vídeos en paralelo
+        # 2. Descargar vídeos
+        _set_step(job_id, 1)
         video_paths = await asyncio.gather(*[
             video_fetcher.fetch_video(
                 scene.keyword, settings.pexels_api_key, job_dir,
@@ -80,47 +163,59 @@ async def generate_video(
             for scene in scenes
         ])
 
-        # 3. Audio con Edge TTS
+        # 3. Generar voz
+        _set_step(job_id, 2)
         full_narration = " ".join(scene.narration for scene in scenes)
-        audio_path = await audio_generator.generate_audio(full_narration, job_dir)
+        audio_path = await audio_generator.generate_audio(full_narration, job_dir, voice=voice)
 
         # 4. Subtítulos
+        _set_step(job_id, 3)
         srt_path = job_dir / f"{job_id}.srt"
-        subtitle_generator.generate_srt(scenes, audio_path, srt_path)
+        if use_subtitles:
+            subtitle_generator.generate_srt(scenes, audio_path, srt_path)
 
-        # 5. Montaje FFmpeg
+        # 5. Ensamblar
+        _set_step(job_id, 4)
         output_path = OUTPUT_DIR / f"{job_id}.mp4"
         await video_assembler.assemble_video(
             list(video_paths), audio_path, job_dir, output_path,
-            srt_path=srt_path if srt_path.exists() else None,
+            srt_path=srt_path if (use_subtitles and srt_path.exists()) else None,
             max_duration=duration,
             orientation=orientation,
             music_path=music_path,
+            subtitle_color=subtitle_color,
+            subtitle_size=subtitle_size,
         )
 
         srt_output = OUTPUT_DIR / f"{job_id}.srt"
         if srt_path.exists():
             shutil.copy2(str(srt_path), str(srt_output))
 
-        video_url = f"http://localhost:8000/api/video/{job_id}.mp4"
-        subtitle_url = f"http://localhost:8000/api/video/{job_id}.srt" if srt_output.exists() else None
-        return GenerateResponse(
-            video_path=str(output_path),
-            video_url=video_url,
-            subtitle_url=subtitle_url,
-            scenes=scenes,
-        )
+        # 6. Listo
+        _set_step(job_id, 5)
+        _jobs[job_id]["status"] = "done"
+        _jobs[job_id]["result"] = {
+            "video_path": str(output_path),
+            "video_url": f"http://localhost:8000/api/video/{job_id}.mp4",
+            "subtitle_url": f"http://localhost:8000/api/video/{job_id}.srt" if srt_output.exists() else None,
+            "scenes": [{"narration": s.narration, "keyword": s.keyword} for s in scenes],
+        }
 
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=502, detail=f"Error en Pexels API: HTTP {e.response.status_code}")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        _jobs[job_id]["status"] = "error"
+        _jobs[job_id]["error"] = str(e)
+
+
+# ── Status polling ────────────────────────────────────────────────────────────
+
+@router.get("/status/{job_id}")
+async def get_status(job_id: str):
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job no encontrado")
+    return job
 
 
 # ── Servir archivos ───────────────────────────────────────────────────────────
