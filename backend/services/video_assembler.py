@@ -67,12 +67,12 @@ async def assemble_video(
     ])
 
     # Paso 3: muxear audio (narración ± música de fondo)
+    # -stream_loop -1 en el vídeo: si los clips son más cortos que el audio, se loopean
     muxed = temp_dir / "muxed.mp4"
     if music_path and music_path.exists():
-        # Mezcla: narración al 100% + música a _MUSIC_VOLUME, duración = narración
         await _run_ffmpeg([
             "ffmpeg", "-y",
-            "-i", str(merged),
+            "-stream_loop", "-1", "-i", str(merged),
             "-i", str(audio_path),
             "-i", str(music_path),
             "-filter_complex",
@@ -88,7 +88,7 @@ async def assemble_video(
     else:
         await _run_ffmpeg([
             "ffmpeg", "-y",
-            "-i", str(merged),
+            "-stream_loop", "-1", "-i", str(merged),
             "-i", str(audio_path),
             "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "copy", "-c:a", "aac",

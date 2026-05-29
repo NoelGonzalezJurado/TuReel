@@ -95,6 +95,7 @@ async def preview_script(request: PreviewRequest):
 @router.post("/generate")
 async def generate_video(
     script: str = Form(...),
+    keywords: str = Form(""),
     duration_seconds: int = Form(60),
     orientation: str = Form("horizontal"),
     voice: str = Form("es-ES-AlvaroNeural"),
@@ -110,7 +111,6 @@ async def generate_video(
     duration = max(5, min(duration_seconds, _MAX_DURATION))
     use_subtitles = subtitles_enabled.strip() not in ("0", "false", "")
 
-    # Guardar música si se subió (hay que leer antes de que cierre el request)
     music_path: Optional[Path] = None
     if music and music.filename:
         music_path = job_dir / "background_music.mp3"
@@ -126,7 +126,7 @@ async def generate_video(
     }
 
     asyncio.create_task(_run_job(
-        job_id, script, duration, orientation, job_dir, music_path,
+        job_id, script, keywords, duration, orientation, job_dir, music_path,
         voice=voice,
         use_subtitles=use_subtitles,
         subtitle_color=subtitle_color,
@@ -139,6 +139,7 @@ async def generate_video(
 async def _run_job(
     job_id: str,
     script: str,
+    keywords: str,
     duration: int,
     orientation: str,
     job_dir: Path,
@@ -149,30 +150,40 @@ async def _run_job(
     subtitle_size: int = 22,
 ):
     try:
-        # 1. Parsear guion
+        import re as _re
+
+        # 1. Parsear guion (solo para narración y subtítulos)
         _set_step(job_id, 0)
         scenes = script_parser.parse_script(script)
 
-        # 2. Descargar vídeos
+        # Keywords para imágenes: los del usuario si los hay, si no auto-extraídos
+        if keywords.strip():
+            kw_list = [k.strip() for k in _re.split(r"[\n,]+", keywords) if k.strip()]
+        else:
+            kw_list = [s.keyword for s in scenes]
+
+        print(f"[generate] {len(kw_list)} keywords: {kw_list}")
+
+        # 2. Descargar un clip por keyword
         _set_step(job_id, 1)
         video_paths = await asyncio.gather(*[
             video_fetcher.fetch_video(
-                scene.keyword, settings.pexels_api_key, job_dir,
+                kw, settings.pexels_api_key, job_dir,
                 orientation=orientation,
             )
-            for scene in scenes
+            for kw in kw_list
         ])
 
         # 3. Generar voz
         _set_step(job_id, 2)
         full_narration = " ".join(scene.narration for scene in scenes)
-        audio_path = await audio_generator.generate_audio(full_narration, job_dir, voice=voice)
+        audio_path, word_boundaries = await audio_generator.generate_audio(full_narration, job_dir, voice=voice)
 
         # 4. Subtítulos
         _set_step(job_id, 3)
         srt_path = job_dir / f"{job_id}.srt"
         if use_subtitles:
-            subtitle_generator.generate_srt(scenes, audio_path, srt_path)
+            subtitle_generator.generate_srt(scenes, audio_path, srt_path, word_boundaries=word_boundaries)
 
         # 5. Ensamblar
         _set_step(job_id, 4)
